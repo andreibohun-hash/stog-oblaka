@@ -39,7 +39,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:16px/1
 header{position:absolute;left:0;right:0;top:env(safe-area-inset-top);display:flex;align-items:center;gap:8px;padding:8px 10px;pointer-events:none;z-index:3;color:#fff7e6}
 header .title{flex:1 1 auto;min-width:0;text-align:center;line-height:1.05;text-shadow:0 1px 3px rgba(20,30,60,.7);background:rgba(30,40,64,.5);border-radius:14px;padding:4px 10px 5px}
 header .title b,header .title span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-header .title b{display:block;font-size:16px;font-weight:900;letter-spacing:.1px}
+header .title b{display:block;font-size:15px;font-weight:900;letter-spacing:.1px}
 header .title span{font-size:12px;color:#f4ecd8;font-weight:800}
 .hbtn{pointer-events:auto;width:40px;height:40px;border:0;border-radius:14px;background:rgba(30,40,64,.5);color:#fff7e6;
   display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}
@@ -154,6 +154,11 @@ const CFG = {
   TOP_HIT_DOWN: 6,        // карта на верху ловит тап ещё на столько юнитов ниже своего края (дальше — уголок второй)
   LEAN_RAD: 0.12,         // наклон карты на краю ямы: соседу до осыпи не хватает одного хода — карта «шатается»
   LEAN_WOBBLE: 0.02,      // покачивание шатающейся карты, рад
+  PRESS_SCALE: 0.93,      // карта под пальцем, пока палец не отпущен
+  SHAKE_PX: 3.5,          // тряска поля, когда карта осыпи легла в яму (юниты; 0 — без тряски)
+  SHAKE_MS: 170,          // длительность тряски
+  SQUASH: 0.16,           // приплющивание карты, упавшей в яму / легшей в отбой
+  SPARK_MS: 520,          // в среднем раз в столько мс золотая под соломой пускает искру
   // время (мс, абсолютное — §4)
   TAKE_MS: 220,           // карта летит в отбой
   SLIDE_DELAY_MS: 120,    // пауза между ходом и первым съездом
@@ -504,6 +509,7 @@ const G = {
   parts: [], fx: [],       // частицы соломы и мелкие эффекты, дедлайны в performance.now()
   cam: { y: 0, from: 0, to: 0, t0: 0, t1: 0 },
   endAt: 0, tipUntil: 0, hand: null, lesson: null, cut: null,
+  press: null, shake: null, flash: null, sparkAt: 0,   // палец на карте, тряска поля, вспышка, следующая искра золотой
   timeScale: 1, paused: false, errors: [],
   botR: mulberry32(4242), fxR: mulberry32(9), lastInput: now(),
 };
@@ -674,9 +680,10 @@ function twPos(w, t){
     return { x: w.x0 + (w.x1 - w.x0) * easeIO(u), y: w.y0 + (w.y1 - w.y0) * u - 9 * Math.sin(Math.PI * u), r: w.dir * 0.12 * Math.sin(Math.PI * u), s: 1 };
   }
   if (w.kind === 'gold'){ const e = easeIO(u); return { x: w.x0 + (w.x1 - w.x0) * e, y: w.y0 + (w.y1 - w.y0) * e, r: 0, s: 1 + 0.7 * e }; }
-  // take / draw — в отбой по дуге
+  // take / draw — в отбой по дуге; снятая карта подскакивает и чуть крутится
   const e = ease(u);
-  return { x: w.x0 + (w.x1 - w.x0) * e, y: w.y0 + (w.y1 - w.y0) * e - 46 * Math.sin(Math.PI * u), r: (w.kind === 'draw' ? 0 : 0.25) * Math.sin(Math.PI * u), s: 1 + (58 / 50 - 1) * e };
+  return { x: w.x0 + (w.x1 - w.x0) * e, y: w.y0 + (w.y1 - w.y0) * e - 46 * Math.sin(Math.PI * u), r: (w.kind === 'draw' ? 0 : 0.3) * Math.sin(Math.PI * u),
+    s: 1 + (58 / 50 - 1) * e + (w.kind === 'draw' ? 0 : 0.14 * Math.sin(Math.PI * Math.min(1, u * 1.6))) };
 }
 function addTw(w){ G.vis.tw.push(w); log('fx.start', w.kind, 'v=' + w.v); }
 function endTweens(t, all){
@@ -708,11 +715,15 @@ function applyVis(e, t){
     if (falling){ const q = twPos(falling, t); from = { x: q.x, y: q.y }; V.tw = V.tw.filter(w => w !== falling); }
     V.lanes = e.lanes; V.p = e.p; V.gl = e.gl;
     if (isGold(e.v)){
-      addTw({ kind: 'gold', v: e.v, x0: from.x, y0: from.y, x1: VW / 2, y1: Math.max(GEO.top + 120, (GEO.top + GEO.trayTop) / 2 - 60), t0: t, t1: t + 650 / ts, lane: -1 });
+      const gy1 = Math.max(GEO.top + 120, (GEO.top + GEO.trayTop) / 2 - 60);
+      addTw({ kind: 'gold', v: e.v, x0: from.x, y0: from.y, x1: VW / 2, y1: gy1, t0: t, t1: t + 650 / ts, lane: -1,
+        onEnd: (quiet) => { if (quiet) return; dust(VW / 2, gy1 + CFG.CARD_H / 2, 34, 'gold'); for (let i = 0; i < 9; i++) G.fx.push({ kind: 'coinfly', i, t0: now() + i * 45, t1: now() + i * 45 + 620, x0: VW / 2, y0: gy1 + CFG.CARD_H / 2 }); } });
       for (let i = 0; i < 3; i++) dust(from.x, from.y + 30, 10, 'gold');
+      G.flash = { t0: t, t1: t + 220 }; buzz([15, 30, 25]);
     } else {
       const d = trayGeo().cur, v = e.v;
-      addTw({ kind: 'take', v, x0: from.x, y0: from.y, x1: d.x, y1: d.y + d.h / 2 - CFG.CARD_H / 2, t0: t, t1: t + CFG.TAKE_MS / ts, lane: -1, onEnd: () => { V.top = v; } });
+      addTw({ kind: 'take', v, x0: from.x, y0: from.y, x1: d.x, y1: d.y + d.h / 2 - CFG.CARD_H / 2, t0: t, t1: t + CFG.TAKE_MS / ts, lane: -1,
+        onEnd: (quiet) => { V.top = v; if (!quiet) G.fx.push({ kind: 'land', t0: now(), t1: now() + 240 }); } });
     }
     if (G.mode === 'bottom') addShift(e.x, -CFG.STEP, t);
   } else {
@@ -721,7 +732,11 @@ function applyVis(e, t){
     if (G.mode === 'bottom'){ addShift(e.y, -CFG.STEP, t); addShift(e.x, CFG.STEP, t); }
     const to = { x: laneX(L, e.x), y: cardY(V.p[e.x], 0) };
     addTw({ kind: 'slide', v: e.v, x0: from.x, y0: from.y, x1: to.x, y1: to.y, t0: t, t1: t + CFG.SLIDE_MS / ts, lane: e.x, dir: Math.sign(e.x - e.y),
-      onEnd: (quiet) => { if (!quiet){ Audio.thump(); dust(to.x, to.y + (G.mode === 'top' ? 6 : CFG.CARD_H - 4), 14); } } });
+      onEnd: (quiet) => { if (quiet) return;
+        const tn = now(), fy = to.y + (G.mode === 'top' ? 6 : CFG.CARD_H - 4);
+        Audio.thump(); dust(to.x, fy, 18); buzz(14);
+        G.fx.push({ kind: 'squash', lane: e.x, t0: tn, t1: tn + 260 }, { kind: 'puff', x: to.x, y: fy + (G.mode === 'top' ? CFG.CARD_H - 10 : 0), t0: tn, t1: tn + 420 });
+        if (CFG.SHAKE_PX && !REDUCED) G.shake = { t0: tn, t1: tn + CFG.SHAKE_MS, amp: CFG.SHAKE_PX }; } });
     Audio.rustle(); dust(from.x, from.y + (G.mode === 'top' ? 4 : CFG.CARD_H - 6), 9); buzz(8);
   }
   // золотая: ближе или глубже после осыпи; вышла наверх
@@ -747,8 +762,9 @@ function applyVis(e, t){
 function dust(x, y, n, kind){
   const R = G.fxR, t = now();
   for (let i = 0; i < n; i++){
-    G.parts.push({ x: x + (R() - 0.5) * CFG.CARD_W, y: y + R() * 8, vx: (R() - 0.5) * 140, vy: -50 - R() * 120, t0: t, life: 450 + R() * 550,
-      len: 3 + R() * 6, a0: R() * Math.PI, spin: (R() - 0.5) * 10, kind: kind || (R() < 0.55 ? 'straw' : 'hi') });
+    const gold = kind === 'gold';
+    G.parts.push({ x: x + (R() - 0.5) * CFG.CARD_W, y: y + R() * 8, vx: (R() - 0.5) * (gold ? 260 : 140), vy: (gold ? -120 : -50) - R() * (gold ? 220 : 120), t0: t, life: 450 + R() * (gold ? 800 : 550),
+      len: 3 + R() * 6, a0: R() * Math.PI, spin: (R() - 0.5) * 10, g: 520, kind: kind || (R() < 0.55 ? 'straw' : 'hi') });
   }
   if (G.parts.length > 320) G.parts.splice(0, G.parts.length - 320);
 }
@@ -771,6 +787,8 @@ function laneTap(x, src){
   if (s.back > b0){ metric('backs', s.back - b0); G.run.lastBackAt = t; if (G.lv.firstBack === null) G.lv.firstBack = Math.round(runMs() / 100) / 10; }
   if (!isGold(v)){
     Audio.play(s.streak); buzz(10);
+    G.fx.push({ kind: 'light', i: s.streak - 1, t0: t + CFG.TAKE_MS, t1: t + CFG.TAKE_MS + 320 });
+    if (s.streak === 5 || s.streak === 10 || s.streak === 15) G.fx.push({ kind: 'streak', n: s.streak, t0: t + CFG.TAKE_MS, t1: t + CFG.TAKE_MS + 1100 });
     if (s.streak >= CFG.COIN_STREAK){ G.save.coins++; G.fx.push({ kind: 'coin', t0: t + CFG.TAKE_MS, t1: t + CFG.TAKE_MS + 800 }); Audio.coin(); }
   }
   if (G.lesson){ G.lesson.step++; lessonStep(); }
@@ -787,7 +805,8 @@ function deckTap(src){
   draw(s); metric('draws'); if (hadMove) metric('vdraws');
   const v = s.top, V = G.vis;
   V.tw.filter(w => w.kind === 'take').forEach(w => { w.onEnd && w.onEnd(true); }); V.tw = V.tw.filter(w => w.kind !== 'take');
-  addTw({ kind: 'draw', v, x0: T.deck.x, y0: T.deck.y + T.deck.h / 2 - CFG.CARD_H / 2, x1: T.cur.x, y1: T.cur.y + T.cur.h / 2 - CFG.CARD_H / 2, t0: t, t1: t + CFG.DRAW_MS / G.timeScale, lane: -1, onEnd: () => { V.top = v; } });
+  addTw({ kind: 'draw', v, x0: T.deck.x, y0: T.deck.y + T.deck.h / 2 - CFG.CARD_H / 2, x1: T.cur.x, y1: T.cur.y + T.cur.h / 2 - CFG.CARD_H / 2, t0: t, t1: t + CFG.DRAW_MS / G.timeScale, lane: -1,
+    onEnd: (quiet) => { V.top = v; if (!quiet) G.fx.push({ kind: 'land', t0: now(), t1: now() + 240 }); } });
   Audio.draw(); buzz(6);
   log('input', 'draw', `src=${src} card=${RANKS[rk(v)]} left=${s.deck.length} hadMove=${hadMove}`);
   afterMove();
@@ -1083,11 +1102,15 @@ cv.addEventListener('pointerdown', (e) => {
   if (down) return;                         // второй палец не считается
   down = { x: e.clientX, y: e.clientY, id: e.pointerId, ts: e.timeStamp };
   try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+  if (G.screen === 'game' && G.s && G.vis && G.phase === 'play'){         // отклик сразу на касание: карта или колода проседает
+    const hp = hitTest(toVirtual(e));
+    G.press = hp && (hp.kind === 'top' || hp.kind === 'deck') ? { lane: hp.kind === 'top' ? hp.x : -1, deck: hp.kind === 'deck', t0: now() } : null;
+  }
 });
 function onUp(e){
   if (!down || e.pointerId !== down.id) return;
   const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y) > CFG.TAP_SLOP;
-  down = null;
+  down = null; G.press = null;
   if (moved || e.type === 'pointercancel') return;
   if (G.screen === 'cut'){ skipCut(); return; }
   tapAt(toVirtual(e));
@@ -1147,29 +1170,61 @@ function drawStar(c, x, y, r, inner){
   c.closePath(); c.fill();
 }
 const suitColor = (v) => { const P = palette(), su = suitOf(v); return su === 1 || su === 2 ? P.cardRed : P.cardBlack; };
-// Лицо карты: белая карта, крупный ранг сверху, масть под ним (как в «Свете в окнах» и «Стоге»).
+// Арт — файлами в assets/ (картинки GPT, см. DESIGN), грузится по имени. Пока файл не пришёл или его нет — то же рисуется
+// кодом ниже (§5, §11). Сборщик артефакта заменяет пути на data-URI.
+const ART_FILES = { bgTop: 'assets/bg-top.jpg', bgBottom: 'assets/bg-bottom.jpg', straw: 'assets/straw.jpg', back: 'assets/card-back.png', gold: 'assets/card-gold.png' };
+const ART = {};
+for (const [k, src] of Object.entries(ART_FILES)){
+  const im = new Image();
+  im.onload = () => { ART[k] = im; SPRITES = {}; HAY_PAT = null; log('event', 'art.load', k); };
+  im.onerror = () => log('event', 'art.miss', k);
+  im.src = src;
+}
+const ready = (k) => !!ART[k];
+const REDUCED = (() => { try { return matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { return false; } })();
+// Спрайты: карта рисуется один раз в маленький холст под текущий масштаб экрана, дальше — drawImage.
+let SPRITES = {}, SPRITE_K = 0;
+function sprite(key, w, h, paint){
+  const k = Math.max(1, Math.min(3, DPR * scale));
+  if (Math.abs(k - SPRITE_K) > 0.01){ SPRITES = {}; SPRITE_K = k; }
+  let s = SPRITES[key];
+  if (!s){ s = document.createElement('canvas'); s.width = Math.ceil(w * k); s.height = Math.ceil(h * k); const g = s.getContext('2d'); g.scale(k, k); paint(g, w, h); SPRITES[key] = s; }
+  return s;
+}
+try { document.fonts.ready.then(() => { SPRITES = {}; }); document.fonts.addEventListener('loadingdone', () => { SPRITES = {}; }); } catch (e) {}
+// Лицо карты: белая карта с тёплым бликом сверху, крупный ранг, масть под ним (как в «Свете в окнах» и «Стоге»).
+function paintFace(g, v, w, h){
+  const P = palette(), rk0 = RANKS[rk(v)];
+  g.fillStyle = P.card; rr(g, 0, 0, w, h, w * 0.14); g.fill();
+  const hl = g.createLinearGradient(0, 0, 0, h * 0.5); hl.addColorStop(0, 'rgba(255,255,255,.9)'); hl.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = hl; g.fill();
+  const lo = g.createLinearGradient(0, h * 0.6, 0, h); lo.addColorStop(0, 'rgba(120,80,30,0)'); lo.addColorStop(1, 'rgba(120,80,30,.12)');
+  g.fillStyle = lo; g.fill();
+  g.strokeStyle = 'rgba(60,40,20,.25)'; g.lineWidth = 1; rr(g, 0.5, 0.5, w - 1, h - 1, w * 0.14); g.stroke();
+  g.fillStyle = suitColor(v); g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = '900 ' + Math.round(w * (rk0 === '10' ? 0.5 : 0.6)) + 'px Nunito, system-ui, sans-serif';
+  g.fillText(rk0, w / 2, h * 0.36);
+  drawSuit(g, suitOf(v), w / 2, h * 0.72, w * 0.36);
+}
 function drawCardFace(c, v, x, y, w, h){
-  const P = palette(), col = suitColor(v), rk0 = RANKS[rk(v)];
   c.fillStyle = 'rgba(40,24,6,.28)'; rr(c, x + 1, y + 2.5, w, h, w * 0.14); c.fill();
-  c.fillStyle = P.card; rr(c, x, y, w, h, w * 0.14); c.fill();
-  c.strokeStyle = 'rgba(60,40,20,.22)'; c.lineWidth = 1; c.stroke();
-  c.fillStyle = col; c.textAlign = 'center'; c.textBaseline = 'middle';
-  c.font = '900 ' + Math.round(w * (rk0 === '10' ? 0.5 : 0.6)) + 'px Nunito, system-ui, sans-serif';
-  c.fillText(rk0, x + w / 2, y + h * 0.36);
-  drawSuit(c, suitOf(v), x + w / 2, y + h * 0.72, w * 0.36);
+  c.drawImage(sprite('f' + v + '_' + w + 'x' + h, w, h, (g) => paintFace(g, v, w, h)), x, y, w, h);
 }
 // Вторая карта: видна только полоска шагом STEP — у нижнего края «сверху», у верхнего «снизу». В полоске ранг и масть.
 function drawPeekCard(c, v, x, y, w, h, stripTop){
-  const P = palette();
+  const rel = Math.round(stripTop - y);
   c.fillStyle = 'rgba(40,24,6,.25)'; rr(c, x + 1, y + 2, w, h, w * 0.14); c.fill();
-  c.fillStyle = P.card; rr(c, x, y, w, h, w * 0.14); c.fill();
-  c.strokeStyle = 'rgba(60,40,20,.22)'; c.lineWidth = 1; c.stroke();
-  const cy = stripTop + CFG.STEP / 2 + 1, rk0 = RANKS[rk(v)];
-  c.fillStyle = suitColor(v); c.textAlign = 'left'; c.textBaseline = 'middle';
-  c.font = '900 18px Nunito, system-ui, sans-serif'; c.fillText(rk0, x + 6, cy);
-  const tw = c.measureText(rk0).width; drawSuit(c, suitOf(v), x + 6 + tw + 9, cy, 12);
+  c.drawImage(sprite('p' + v + '_' + rel + '_' + w + 'x' + h, w, h, (g) => {
+    const P = palette();
+    g.fillStyle = P.card; rr(g, 0, 0, w, h, w * 0.14); g.fill();
+    g.strokeStyle = 'rgba(60,40,20,.25)'; g.lineWidth = 1; rr(g, 0.5, 0.5, w - 1, h - 1, w * 0.14); g.stroke();
+    const cy = rel + CFG.STEP / 2 + 1, rk0 = RANKS[rk(v)];
+    g.fillStyle = suitColor(v); g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.font = '900 18px Nunito, system-ui, sans-serif'; g.fillText(rk0, 6, cy);
+    const tw = g.measureText(rk0).width; drawSuit(g, suitOf(v), 6 + tw + 9, cy, 12);
+  }), x, y, w, h);
 }
-// Соломенная рубашка: золотистая карта со штриховкой соломинками (узор печётся один раз в маленький холст).
+// Соломенная рубашка: арт GPT (плетёная солома со снопиком) или кодом — золотистая карта со штриховкой соломинками.
 let STRAW_PAT = null;
 function strawPattern(c){
   if (STRAW_PAT) return STRAW_PAT;
@@ -1182,23 +1237,51 @@ function strawPattern(c){
   }
   return (STRAW_PAT = c.createPattern(n, 'repeat'));
 }
-function drawStrawBack(c, x, y, w, h){
-  const P = palette();
-  c.fillStyle = 'rgba(60,35,5,.3)'; rr(c, x + 1, y + 2, w, h, w * 0.14); c.fill();
-  const g = c.createLinearGradient(x, y, x + w, y + h); g.addColorStop(0, P.strawHi); g.addColorStop(0.55, P.straw); g.addColorStop(1, P.strawLo);
-  c.fillStyle = g; rr(c, x, y, w, h, w * 0.14); c.fill();
-  c.save(); c.clip(); c.fillStyle = strawPattern(c); c.globalAlpha = 0.8; c.fillRect(x, y, w, h); c.restore();
-  c.strokeStyle = 'rgba(122,85,24,.55)'; c.lineWidth = 1.2; rr(c, x + 0.5, y + 0.5, w - 1, h - 1, w * 0.13); c.stroke();
+// Узор тела стога: солома GPT, отражённая 2×2 (шва не видно), или штриховка кодом.
+let HAY_PAT = null, HAY_K = 0;
+function hayPattern(c){
+  if (!ready('straw')) return strawPattern(c);
+  const k = Math.max(1, Math.min(3, DPR * scale));
+  if (HAY_PAT && Math.abs(k - HAY_K) < 0.01) return HAY_PAT;
+  const S = 150 * k, n = document.createElement('canvas'); n.width = n.height = Math.round(2 * S);
+  const g = n.getContext('2d');
+  for (const [mx, my] of [[0, 0], [1, 0], [0, 1], [1, 1]]){ g.save(); g.translate(mx ? 2 * S : 0, my ? 2 * S : 0); g.scale(mx ? -1 : 1, my ? -1 : 1); g.drawImage(ART.straw, 0, 0, S, S); g.restore(); }
+  HAY_PAT = c.createPattern(n, 'repeat'); HAY_K = k;
+  try { HAY_PAT.setTransform(new DOMMatrix().scale(1 / k)); } catch (e) {}
+  return HAY_PAT;
 }
-// Золотая карта лицом: золото, звезда, бегущий блик.
-function drawGoldFace(c, x, y, w, h, t){
+function paintBack(g, w, h){
   const P = palette();
+  rr(g, 0, 0, w, h, w * 0.14); g.save(); g.clip();
+  if (ready('back')) g.drawImage(ART.back, 0, 0, w, h);
+  else {
+    const gr = g.createLinearGradient(0, 0, w, h); gr.addColorStop(0, P.strawHi); gr.addColorStop(0.55, P.straw); gr.addColorStop(1, P.strawLo);
+    g.fillStyle = gr; g.fillRect(0, 0, w, h); g.fillStyle = strawPattern(g); g.globalAlpha = 0.8; g.fillRect(0, 0, w, h); g.globalAlpha = 1;
+  }
+  g.restore();
+  g.strokeStyle = 'rgba(122,85,24,.55)'; g.lineWidth = 1.2; rr(g, 0.6, 0.6, w - 1.2, h - 1.2, w * 0.13); g.stroke();
+}
+function drawStrawBack(c, x, y, w, h){
+  c.fillStyle = 'rgba(60,35,5,.3)'; rr(c, x + 1, y + 2, w, h, w * 0.14); c.fill();
+  c.drawImage(sprite('b' + w + 'x' + h, w, h, paintBack), x, y, w, h);
+}
+// Золотая карта: арт GPT (золото со звездой и иголкой) или кодом — золото и звезда; поверх — сияние и бегущий блик.
+function paintGold(g, w, h){
+  const P = palette();
+  rr(g, 0, 0, w, h, w * 0.14); g.save(); g.clip();
+  if (ready('gold')) g.drawImage(ART.gold, 0, 0, w, h);
+  else {
+    const gr = g.createLinearGradient(0, 0, w, h); gr.addColorStop(0, P.goldHi); gr.addColorStop(0.45, P.gold); gr.addColorStop(1, P.goldLo);
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    g.strokeStyle = 'rgba(120,70,10,.55)'; g.lineWidth = 2; rr(g, 2, 2, w - 4, h - 4, w * 0.11); g.stroke();
+    g.fillStyle = P.goldInk; drawStar(g, w / 2, h * 0.5, w * 0.3);
+  }
+  g.restore();
+}
+function drawGoldFace(c, x, y, w, h, t){
   c.save();
-  c.shadowColor = 'rgba(255,200,80,.9)'; c.shadowBlur = 14 + 6 * Math.sin(t / 260);
-  const g = c.createLinearGradient(x, y, x + w, y + h); g.addColorStop(0, P.goldHi); g.addColorStop(0.45, P.gold); g.addColorStop(1, P.goldLo);
-  c.fillStyle = g; rr(c, x, y, w, h, w * 0.14); c.fill(); c.shadowBlur = 0;
-  c.strokeStyle = 'rgba(120,70,10,.55)'; c.lineWidth = 2; rr(c, x + 2, y + 2, w - 4, h - 4, w * 0.11); c.stroke();
-  c.fillStyle = P.goldInk; drawStar(c, x + w / 2, y + h * 0.5, w * 0.3);
+  c.shadowColor = 'rgba(255,200,80,.95)'; c.shadowBlur = 16 + 8 * Math.sin(t / 260);
+  c.drawImage(sprite('g' + w + 'x' + h, w, h, paintGold), x, y, w, h); c.shadowBlur = 0;
   rr(c, x, y, w, h, w * 0.14); c.clip(); drawGlint(c, x, y, w, h, t);
   c.restore();
 }
@@ -1207,15 +1290,13 @@ function drawGlint(c, x, y, w, h, t){
   const g = c.createLinearGradient(gx - 18, y, gx + 18, y + 8); g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(0.5, 'rgba(255,255,255,.75)'); g.addColorStop(1, 'rgba(255,255,255,0)');
   c.fillStyle = g; c.fillRect(x, y, w, h);
 }
-// Золотая под соломой: блестит сквозь рубашку — золото под редкой штриховкой, блик и искра в видимой полоске.
+// Золотая под соломой: блестит сквозь рубашку — золото под редкой соломой, блик и искры в видимой полоске.
 function drawGoldUnderStraw(c, x, y, w, h, t, stripY){
   const P = palette();
   c.save();
-  c.shadowColor = 'rgba(255,205,90,.85)'; c.shadowBlur = 10 + 6 * Math.sin(t / 300);
-  const g = c.createLinearGradient(x, y, x + w, y + h); g.addColorStop(0, P.goldHi); g.addColorStop(0.5, P.gold); g.addColorStop(1, P.goldLo);
-  c.fillStyle = g; rr(c, x, y, w, h, w * 0.14); c.fill(); c.shadowBlur = 0;
-  c.clip(); c.fillStyle = strawPattern(c); c.globalAlpha = 0.42; c.fillRect(x, y, w, h); c.globalAlpha = 1;
-  drawGlint(c, x, y, w, h, t);
+  c.shadowColor = 'rgba(255,205,90,.9)'; c.shadowBlur = 12 + 7 * Math.sin(t / 300);
+  c.drawImage(sprite('u' + w + 'x' + h, w, h, (g) => { paintGold(g, w, h); rr(g, 0, 0, w, h, w * 0.14); g.save(); g.clip(); g.fillStyle = strawPattern(g); g.globalAlpha = 0.45; g.fillRect(0, 0, w, h); g.restore(); }), x, y, w, h);
+  c.shadowBlur = 0; rr(c, x, y, w, h, w * 0.14); c.clip(); drawGlint(c, x, y, w, h, t);
   c.restore();
   const tw = 0.5 + 0.5 * Math.sin(t / 180);
   c.fillStyle = 'rgba(255,255,255,' + (0.55 + 0.45 * tw).toFixed(2) + ')'; drawStar(c, x + w * 0.72, stripY + CFG.STEP / 2, 4 + 3 * tw, 0.3);
@@ -1252,45 +1333,105 @@ function drawHand(c, x, y, t){
   c.restore();
 }
 
-// Фон «сверху»: небо, облака вокруг верхушки стога, тело стога с ямами по столбикам.
+// Картинка-фон «обложкой» по ширине кадра, сдвиг вверх на par (параллакс за камерой), низ — до края.
+function drawBackdrop(c, img, par, ax){
+  const k = Math.max(VW / img.naturalWidth, (H + 80) / img.naturalHeight), w = img.naturalWidth * k, h = img.naturalHeight * k;
+  c.drawImage(img, (VW - w) * (ax === undefined ? 0.5 : ax), -Math.min(par, h - H), w, h);
+}
+// Ветер: редкие соломинки летят поперёк кадра (позиция — от абсолютного времени, без состояния).
+function drawWind(c, t, y0, y1){
+  const P = palette(); c.save(); c.lineCap = 'round'; c.lineWidth = 1.5;
+  for (let i = 0; i < 9; i++){
+    const sp = 20 + (i * 37) % 23, x = ((t / 1000) * sp * 3 + i * 97) % (VW + 60) - 30;
+    const y = y0 + ((i * 151) % 997) / 997 * (y1 - y0) + Math.sin(t / 900 + i) * 14, a = t / 380 + i * 1.7;
+    c.globalAlpha = 0.55; c.strokeStyle = i % 2 ? P.strawHi : P.straw;
+    c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.cos(a) * 7, y + Math.sin(a) * 3); c.stroke();
+  }
+  c.restore();
+}
+// Соломинки, торчащие из края стога (раскладка — от сида, рисуется по контуру).
+const STRANDS = (() => { const R = mulberry32(77), a = []; for (let i = 0; i < 70; i++) a.push({ u: R(), l: 5 + R() * 9, a: (R() - 0.5) * 1.1, hi: R() < 0.5 }); return a; })();
+// Фон «сверху»: небо над морем облаков, верхушка стога с ямами по столбикам, облачный пояс по бокам — «стог до облаков».
 function drawSceneTop(c, t){
   const P = palette(), V = G.vis, L = V.lanes.length, cam = G.cam.y;
-  const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, P.skyTop); g.addColorStop(0.55, P.skyMid); g.addColorStop(1, P.skyLow);
-  c.fillStyle = g; c.fillRect(0, 0, VW, H);
-  const drift = (t / 90) % (VW + 200);
-  drawCloud(c, (drift + 40) % (VW + 200) - 100, GEO.y0 - 70 - cam * 0.3, 26, 0.8);
-  drawCloud(c, (drift * 0.6 + 260) % (VW + 200) - 100, GEO.y0 - 30 - cam * 0.3, 18, 0.7);
-  // тело стога: купол чуть выше поверхности, расширяется книзу
-  const xl = laneX(L, 0) - CFG.PITCH / 2 - 14, xr = laneX(L, L - 1) + CFG.PITCH / 2 + 14, top = GEO.y0 - 20 - cam;
-  c.beginPath(); c.moveTo(xl - 26, top + 30);
-  c.quadraticCurveTo(xl - 18, top - 2, xl + 30, top - 4); c.lineTo(xr - 30, top - 4); c.quadraticCurveTo(xr + 18, top - 2, xr + 26, top + 30);
-  c.quadraticCurveTo(xr + 80, top + 300, xr + 150, H + 40); c.lineTo(xl - 150, H + 40); c.quadraticCurveTo(xl - 80, top + 300, xl - 26, top + 30); c.closePath();
-  const bg = c.createLinearGradient(0, top, 0, H); bg.addColorStop(0, P.strawHi); bg.addColorStop(0.25, P.straw); bg.addColorStop(1, P.strawLo);
-  c.fillStyle = bg; c.fill();
-  c.save(); c.clip(); c.fillStyle = strawPattern(c); c.globalAlpha = 0.65; c.fillRect(0, top - 10, VW, H); c.restore();
-  // ямы: от поверхности до верхней карты каждого столбика — тёмная выемка; ступеньки рельефа видны сразу
-  for (let x = 0; x < L; x++){
-    const cx = laneX(L, x), yt = cardY(V.p[x], 0), y1 = yt + 10;
-    if (y1 <= GEO.y0 - cam + 2) continue;
-    const pg = c.createLinearGradient(0, GEO.y0 - cam - 8, 0, y1); pg.addColorStop(0, P.pitLo); pg.addColorStop(1, P.pit);
-    c.fillStyle = pg; rr(c, cx - CFG.PITCH / 2 + 1, GEO.y0 - cam - 10, CFG.PITCH - 2, y1 - (GEO.y0 - cam - 10), 6); c.fill();
+  if (ready('bgTop')) drawBackdrop(c, ART.bgTop, cam * 0.25, 0);          // солнце в левом верхнем углу
+  else {
+    const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, P.skyTop); g.addColorStop(0.55, P.skyMid); g.addColorStop(1, P.skyLow);
+    c.fillStyle = g; c.fillRect(0, 0, VW, H);
   }
-  // облачный пояс по бокам стога, ниже верхушки — «стог до облаков»
+  const drift = (t / 90) % (VW + 200);
+  drawCloud(c, (drift + 40) % (VW + 200) - 100, GEO.y0 - 74 - cam * 0.3, 24, 0.75);
+  // тело стога: купол чуть выше поверхности, расширяется книзу; блик слева, тень к краям
+  const xl = laneX(L, 0) - CFG.PITCH / 2 - 14, xr = laneX(L, L - 1) + CFG.PITCH / 2 + 14, top = GEO.y0 - 20 - cam;
+  const body = new Path2D();
+  body.moveTo(xl - 26, top + 30);
+  body.quadraticCurveTo(xl - 18, top - 2, xl + 30, top - 4); body.lineTo(xr - 30, top - 4); body.quadraticCurveTo(xr + 18, top - 2, xr + 26, top + 30);
+  body.quadraticCurveTo(xr + 80, top + 300, xr + 150, H + 40); body.lineTo(xl - 150, H + 40); body.quadraticCurveTo(xl - 80, top + 300, xl - 26, top + 30); body.closePath();
+  c.save(); c.shadowColor = 'rgba(80,50,10,.35)'; c.shadowBlur = 18; c.fillStyle = P.straw; c.fill(body); c.restore();
+  c.save(); c.clip(body);
+  c.fillStyle = hayPattern(c); c.fillRect(0, top - 10, VW, H - top + 20);
+  const sh = c.createLinearGradient(0, 0, VW, 0); sh.addColorStop(0, 'rgba(90,50,5,.38)'); sh.addColorStop(0.18, 'rgba(90,50,5,0)'); sh.addColorStop(0.82, 'rgba(90,50,5,0)'); sh.addColorStop(1, 'rgba(90,50,5,.42)');
+  c.fillStyle = sh; c.fillRect(0, top - 10, VW, H - top + 20);
+  const hl = c.createRadialGradient(VW * 0.3, top + 30, 10, VW * 0.3, top + 30, 260); hl.addColorStop(0, 'rgba(255,245,200,.35)'); hl.addColorStop(1, 'rgba(255,245,200,0)');
+  c.fillStyle = hl; c.fillRect(0, top - 10, VW, 400);
+  const dn = c.createLinearGradient(0, top + 200, 0, H); dn.addColorStop(0, 'rgba(70,40,5,0)'); dn.addColorStop(1, 'rgba(70,40,5,.3)');
+  c.fillStyle = dn; c.fillRect(0, top + 200, VW, H);
+  c.restore();
+  c.save(); c.lineCap = 'round';
+  for (const s of STRANDS){
+    const x = xl - 20 + s.u * (xr - xl + 40), y = top - 3 + (x < xl + 24 ? (xl + 24 - x) * 0.9 : x > xr - 24 ? (x - xr + 24) * 0.9 : 0);
+    c.strokeStyle = s.hi ? P.strawHi : P.straw; c.lineWidth = 1.6;
+    c.beginPath(); c.moveTo(x, y + 3); c.lineTo(x + Math.sin(s.a) * s.l, y + 3 - Math.cos(s.a) * s.l); c.stroke();
+  }
+  c.restore();
+  drawWind(c, t, GEO.top + 20, GEO.y0 - 10);
+  // ямы: от поверхности до верхней карты каждого столбика — выемка; где сосед мельче, видна стенка; сверху — соломенная кромка
+  const surf = GEO.y0 - cam - 10;
+  for (let x = 0; x < L; x++){
+    const cx = laneX(L, x), yt = cardY(V.p[x], 0), y1 = yt + 12;
+    if (y1 <= surf + 14) continue;
+    const x0 = cx - CFG.PITCH / 2 + 1, w = CFG.PITCH - 2;
+    const pg = c.createLinearGradient(0, surf, 0, y1); pg.addColorStop(0, P.pitLo); pg.addColorStop(1, P.pit);
+    c.fillStyle = pg; c.fillRect(x0, surf, w, y1 - surf);
+    for (const [nx, side] of [[x - 1, 0], [x + 1, 1]]){
+      const ny = nx >= 0 && nx < L ? cardY(V.p[nx], 0) + 12 : surf;
+      if (ny >= y1 - 2) continue;
+      const wy = Math.max(surf, ny), wg = c.createLinearGradient(side ? x0 + w : x0, 0, side ? x0 + w - 9 : x0 + 9, 0);
+      wg.addColorStop(0, 'rgba(10,5,0,.5)'); wg.addColorStop(1, 'rgba(10,5,0,0)');
+      c.fillStyle = wg; c.fillRect(side ? x0 + w - 9 : x0, wy, 9, y1 - wy);
+    }
+    const lip = c.createLinearGradient(0, surf, 0, surf + 18); lip.addColorStop(0, 'rgba(0,0,0,.55)'); lip.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = lip; c.fillRect(x0, surf, w, 18);
+    c.fillStyle = P.strawHi; rr(c, x0 - 2, surf - 4, w + 4, 6, 3); c.fill();
+    c.fillStyle = 'rgba(122,85,24,.6)'; c.fillRect(x0, surf + 1, w, 1.5);
+  }
+  // облачный пояс по бокам стога, ниже верхушки
   const by = GEO.y0 + 250 - cam * 0.55;
   drawCloud(c, -10, by, 34, 0.95); drawCloud(c, VW + 6, by + 24, 36, 0.95); drawCloud(c, 26, by + 70, 24, 0.85); drawCloud(c, VW - 20, by + 96, 26, 0.85);
 }
-// Фон «снизу»: небо, поле, стог встаёт с земли и уходит в облака.
+// Фон «снизу»: поле на закате, стог встаёт с земли и уходит в облака.
 function drawSceneBottom(c, t){
   const P = palette(), V = G.vis, L = V.lanes.length;
-  const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, P.skyTop); g.addColorStop(0.5, P.skyMid); g.addColorStop(1, P.skyLow);
-  c.fillStyle = g; c.fillRect(0, 0, VW, H);
-  c.fillStyle = P.groundLo; c.fillRect(0, GEO.yg - 6, VW, H - GEO.yg + 6);
-  c.fillStyle = P.ground; c.fillRect(0, GEO.yg - 6, VW, 10);
+  if (ready('bgBottom')) drawBackdrop(c, ART.bgBottom, Math.max(0, ART.bgBottom.naturalHeight * Math.max(VW / ART.bgBottom.naturalWidth, (H + 80) / ART.bgBottom.naturalHeight) * 0.72 - GEO.yg));
+  else {
+    const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, P.skyTop); g.addColorStop(0.5, P.skyMid); g.addColorStop(1, P.skyLow);
+    c.fillStyle = g; c.fillRect(0, 0, VW, H);
+    c.fillStyle = P.groundLo; c.fillRect(0, GEO.yg - 6, VW, H - GEO.yg + 6);
+    c.fillStyle = P.ground; c.fillRect(0, GEO.yg - 6, VW, 10);
+  }
   const xl = laneX(L, 0) - CFG.PITCH / 2 - 10, xr = laneX(L, L - 1) + CFG.PITCH / 2 + 10;
-  c.beginPath(); c.moveTo(xl - 44, GEO.yg + 2); c.quadraticCurveTo(xl - 18, GEO.yg - 120, xl - 6, GEO.top - 40); c.lineTo(xr + 6, GEO.top - 40);
-  c.quadraticCurveTo(xr + 18, GEO.yg - 120, xr + 44, GEO.yg + 2); c.closePath();
-  const bg = c.createLinearGradient(0, GEO.top, 0, GEO.yg); bg.addColorStop(0, P.straw); bg.addColorStop(1, P.strawLo);
-  c.fillStyle = bg; c.fill(); c.save(); c.clip(); c.fillStyle = strawPattern(c); c.globalAlpha = 0.65; c.fillRect(0, GEO.top - 40, VW, GEO.yg); c.restore();
+  c.fillStyle = 'rgba(40,30,5,.35)'; c.beginPath(); c.ellipse(VW / 2, GEO.yg + 4, (xr - xl) / 2 + 70, 14, 0, 0, Math.PI * 2); c.fill();
+  const body = new Path2D();                                              // стог уже кадра: по бокам видно небо и поле
+  body.moveTo(xl - 30, GEO.yg + 2); body.quadraticCurveTo(xl + 2, GEO.yg - 90, xl + 6, GEO.top - 40); body.lineTo(xr - 6, GEO.top - 40);
+  body.quadraticCurveTo(xr - 2, GEO.yg - 90, xr + 30, GEO.yg + 2); body.closePath();
+  c.fillStyle = P.straw; c.fill(body);
+  c.save(); c.clip(body); c.fillStyle = hayPattern(c); c.fillRect(0, GEO.top - 40, VW, GEO.yg - GEO.top + 60);
+  const sh = c.createLinearGradient(xl - 44, 0, xr + 44, 0); sh.addColorStop(0, 'rgba(90,50,5,.45)'); sh.addColorStop(0.2, 'rgba(90,50,5,0)'); sh.addColorStop(0.75, 'rgba(90,50,5,0)'); sh.addColorStop(1, 'rgba(90,50,5,.45)');
+  c.fillStyle = sh; c.fillRect(0, GEO.top - 40, VW, GEO.yg);
+  const ao = c.createLinearGradient(0, GEO.yg - 40, 0, GEO.yg); ao.addColorStop(0, 'rgba(60,35,5,0)'); ao.addColorStop(1, 'rgba(60,35,5,.4)');
+  c.fillStyle = ao; c.fillRect(0, GEO.yg - 40, VW, 42);
+  c.restore();
+  drawWind(c, t, GEO.top + 120, GEO.yg - 60);
 }
 function drawCloudCap(c, t){                // «снизу»: облака закрывают верх столбиков — все уходят в небо и выглядят одинаково
   const y = GEO.top + 18, drift = Math.sin(t / 2400) * 10;
@@ -1306,6 +1447,7 @@ function leanDir(V, y){
   return 0;
 }
 // Столбики: от глубоких карт к верхней (верхняя рисуется последней и закрывает остальные, кроме полосок).
+// Верхняя карта: палец на ней — проседает; шатается к соседу; упала в яму — приплющивается; «сверху» на дне ямы — в тени.
 function drawColumns(c, t){
   const V = G.vis, L = V.lanes.length, W = CFG.CARD_W, Hc = CFG.CARD_H, top = G.mode === 'top';
   const hidden = new Set(V.tw.filter(w => w.kind === 'slide').map(w => w.lane));
@@ -1319,17 +1461,27 @@ function drawColumns(c, t){
       const v = a[n - 1 - k], y = cardY(V.p[x], k) + off, xx = cx - W / 2 + wiggleX(x, k, t);
       const stripY = top ? y + Hc - CFG.STEP : y;
       if (k === 0){
+        c.save();
         const d = leanDir(V, x);
-        if (d){ const px = xx + (d > 0 ? W : 0), py = y + Hc; c.save(); c.translate(px, py); c.rotate(d * (CFG.LEAN_RAD + CFG.LEAN_WOBBLE * Math.sin(t / 130))); c.translate(-px, -py); }
-        if (isGold(v)) drawGoldFace(c, xx, y, W, Hc, t); else drawCardFace(c, v, xx, y, W, Hc);
-        if (d) c.restore();
+        if (d){ const px = xx + (d > 0 ? W : 0), py = y + Hc; c.translate(px, py); c.rotate(d * (CFG.LEAN_RAD + CFG.LEAN_WOBBLE * Math.sin(t / 130))); c.translate(-px, -py); }
+        const sq = G.fx.find(f => f.kind === 'squash' && f.lane === x && t >= f.t0 && t < f.t1);
+        if (sq){ const u = (t - sq.t0) / (sq.t1 - sq.t0), s = CFG.SQUASH * Math.sin(Math.PI * Math.min(1, u * 1.6)) * (1 - u);
+          c.translate(xx + W / 2, y + Hc); c.scale(1 + s * 0.6, 1 - s); c.translate(-(xx + W / 2), -(y + Hc)); }
+        if (G.press && G.press.lane === x){ const s = CFG.PRESS_SCALE; c.translate(xx + W / 2, y + Hc / 2); c.scale(s, s); c.translate(-(xx + W / 2), -(y + Hc / 2)); }
+        if (isGold(v)){ drawGoldRays(c, xx + W / 2, y + Hc / 2, t, 1); drawGoldFace(c, xx, y, W, Hc, t); }
+        else drawCardFace(c, v, xx, y, W, Hc);
+        if (top && V.p[x] > 0 && !isGold(v)){                // на дне ямы — тень от стенок
+          const sg = c.createLinearGradient(0, y, 0, y + Hc * 0.5); sg.addColorStop(0, 'rgba(40,20,0,' + Math.min(0.3, 0.06 * V.p[x]).toFixed(2) + ')'); sg.addColorStop(1, 'rgba(40,20,0,0)');
+          c.fillStyle = sg; rr(c, xx, y, W, Hc, W * 0.14); c.fill();
+        }
+        c.restore();
       }
       else if (k === 1 && CFG.PEEK){ if (isGold(v)) drawGoldUnderStraw(c, xx, y, W, Hc, t, stripY); else drawPeekCard(c, v, xx, y, W, Hc, stripY); }
       else if (isGold(v)) drawGoldUnderStraw(c, xx, y, W, Hc, t, stripY);
       else drawStrawBack(c, xx, y, W, Hc);
     }
   }
-  // отклик золотой: ближе — вспышка, глубже — тусклое кольцо
+  // отклик золотой: ближе — вспышка, глубже — тусклое кольцо, подпись со стрелкой
   const gx = V.gl[0];
   if (gx !== undefined && gx >= 0){
     const d = visGoldDepth(V), y = cardY(V.p[gx], d) + laneOff(gx, t), sy = top ? y + Hc - CFG.STEP : y, cx = laneX(L, gx);
@@ -1348,81 +1500,157 @@ function drawColumns(c, t){
     }
   }
 }
+// Лучи за золотой картой: медленно вращаются, пульсируют. x, y — центр, s — масштаб.
+function drawGoldRays(c, x, y, t, s){
+  c.save(); c.translate(x, y); c.rotate(t / 2600); c.globalAlpha = 0.32 + 0.12 * Math.sin(t / 320);
+  const g = c.createRadialGradient(0, 0, 8, 0, 0, 74 * s); g.addColorStop(0, 'rgba(255,240,170,.95)'); g.addColorStop(1, 'rgba(255,240,170,0)');
+  c.fillStyle = g;
+  for (let i = 0; i < 10; i++){ c.rotate(Math.PI / 5); c.beginPath(); c.moveTo(0, 0); c.lineTo(-9 * s, -74 * s); c.lineTo(9 * s, -74 * s); c.closePath(); c.fill(); }
+  c.restore();
+}
+// Золотая под соломой пускает искру раз в ~SPARK_MS — «блестит сквозь солому».
+function sparkGold(t){
+  const V = G.vis, gx = V.gl[0]; if (gx === undefined || gx < 0 || t < G.sparkAt) return;
+  const R = G.fxR; G.sparkAt = t + CFG.SPARK_MS * (0.5 + R());
+  const d = visGoldDepth(V); if (d <= 0) return;
+  const y = cardY(V.p[gx], d) + laneOff(gx, t), sy = G.mode === 'top' ? y + CFG.CARD_H - CFG.STEP / 2 : y + CFG.STEP / 2;
+  if (sy < GEO.top || sy > GEO.trayTop) return;
+  G.parts.push({ x: laneX(V.lanes.length, gx) + (R() - 0.5) * CFG.CARD_W * 0.8, y: sy, vx: (R() - 0.5) * 24, vy: -26 - R() * 30, g: -10, t0: t, life: 700 + R() * 600, len: 2.5 + R() * 2.5, a0: 0, spin: 0, kind: 'spark' });
+}
 function drawTweens(c, t){
   const V = G.vis, W = CFG.CARD_W, Hc = CFG.CARD_H;
   for (const w of V.tw){
     if (t < w.t0) continue;
+    const u = clamp01((t - w.t0) / (w.t1 - w.t0));
+    if (w.kind === 'slide') for (let j = 3; j >= 1; j--){            // шлейф осыпи: три бледные копии позади
+      const q = twPos(w, t - j * 26 / G.timeScale); if (t - j * 26 < w.t0) continue;
+      c.save(); c.globalAlpha = 0.16 / j; c.translate(q.x, q.y + Hc / 2); c.rotate(q.r); drawCardFace(c, w.v, -W / 2, -Hc / 2, W, Hc); c.restore();
+    }
     const q = twPos(w, t);
     c.save(); c.translate(q.x, q.y + Hc / 2); c.rotate(q.r); c.scale(q.s, q.s);
-    if (w.kind === 'gold'){
-      const u = clamp01((t - w.t0) / (w.t1 - w.t0));
-      c.save(); c.globalAlpha = 0.6 * u; c.fillStyle = '#fff1b0';
-      for (let i = 0; i < 12; i++){ c.rotate(Math.PI / 6); c.beginPath(); c.moveTo(0, 0); c.lineTo(-6, -90 * u); c.lineTo(6, -90 * u); c.closePath(); c.fill(); }
-      c.restore();
-      drawGoldFace(c, -W / 2, -Hc / 2, W, Hc, t);
-    } else drawCardFace(c, w.v, -W / 2, -Hc / 2, W, Hc);
+    if (w.kind === 'gold'){ drawGoldRays(c, 0, 0, t, 0.6 + 1.2 * u); drawGoldFace(c, -W / 2, -Hc / 2, W, Hc, t); }
+    else if (w.kind === 'draw'){                                      // карта из колоды переворачивается на лету
+      c.scale(Math.max(0.04, Math.abs(Math.cos(Math.PI * u))), 1);
+      if (u < 0.5) drawStrawBack(c, -W / 2, -Hc / 2, W, Hc); else drawCardFace(c, w.v, -W / 2, -Hc / 2, W, Hc);
+    }
+    else drawCardFace(c, w.v, -W / 2, -Hc / 2, W, Hc);
     c.restore();
   }
 }
 function drawParts(c, t){
   const P = palette(), keep = [];
+  for (const f of G.fx){                                            // облачко соломенной пыли там, где карта легла
+    if (f.kind !== 'puff' || t < f.t0 || t > f.t1) continue;
+    const u = (t - f.t0) / (f.t1 - f.t0);
+    c.save(); c.globalAlpha = 0.5 * (1 - u); c.fillStyle = P.strawHi;
+    for (const s of [-1, 1]){ c.beginPath(); c.ellipse(f.x + s * (14 + 26 * u), f.y - 4 * u, 12 + 10 * u, 6 + 5 * u, 0, 0, Math.PI * 2); c.fill(); }
+    c.restore();
+  }
   for (const p of G.parts){
     const tau = (t - p.t0) / 1000, u = (t - p.t0) / p.life; if (u >= 1) continue; keep.push(p);
-    const x = p.x + p.vx * tau, y = p.y + p.vy * tau + 0.5 * 520 * tau * tau, a = p.a0 + p.spin * tau;
-    c.globalAlpha = 1 - u; c.strokeStyle = p.kind === 'gold' ? P.goldHi : p.kind === 'hi' ? P.strawHi : P.strawLo; c.lineWidth = p.kind === 'gold' ? 2.4 : 1.6;
+    const x = p.x + p.vx * tau, y = p.y + p.vy * tau + 0.5 * (p.g === undefined ? 520 : p.g) * tau * tau, a = p.a0 + p.spin * tau;
+    c.globalAlpha = p.kind === 'spark' ? Math.sin(Math.PI * u) : 1 - u;
+    if (p.kind === 'spark'){ c.fillStyle = '#fffbe0'; drawStar(c, x, y, p.len, 0.28); continue; }
+    c.strokeStyle = p.kind === 'gold' ? P.goldHi : p.kind === 'hi' ? P.strawHi : P.strawLo; c.lineWidth = p.kind === 'gold' ? 2.4 : 1.6;
     c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.cos(a) * p.len, y + Math.sin(a) * p.len); c.stroke();
   }
   c.globalAlpha = 1; G.parts = keep;
 }
+// Панель: доска, серия огоньками, колода, призраки ±1 над отбоем, отбой. Отклики — на месте.
 function drawTray(c, t){
   const P = palette(), T = trayGeo(), s = G.s, V = G.vis;
   const g = c.createLinearGradient(0, T.y, 0, H); g.addColorStop(0, P.trayHi); g.addColorStop(0.18, P.tray); g.addColorStop(1, P.trayLo);
   c.fillStyle = 'rgba(30,18,6,.35)'; rr(c, 0, T.y - 3, VW, H - T.y + 20, 20); c.fill();
   c.fillStyle = g; rr(c, 0, T.y, VW, H - T.y + 20, 20); c.fill();
-  // серия: огоньки вдоль края
-  const n = 10, st = Math.min(n, s.streak);
+  c.save(); rr(c, 0, T.y, VW, H - T.y + 20, 20); c.clip();                  // волокна доски
+  c.strokeStyle = 'rgba(255,220,170,.05)'; c.lineWidth = 2;
+  for (let i = 0; i < 9; i++){ const y = T.y + 26 + i * 21; c.beginPath(); c.moveTo(0, y); c.bezierCurveTo(VW * 0.3, y + 5, VW * 0.6, y - 5, VW, y + 2); c.stroke(); }
+  c.restore();
+  c.fillStyle = 'rgba(255,230,180,.16)'; c.fillRect(14, T.y + 1, VW - 28, 2);
+  // серия: огоньки вдоль края; новый вспыхивает, от 5 — горячее
+  const n = 10, st = Math.min(n, s.streak), hot = s.streak >= 5;
   for (let i = 0; i < n; i++){
     const x = 40 + (VW - 80) * (i + 0.5) / n, on = i < st;
-    c.fillStyle = on ? '#ffe08a' : 'rgba(255,255,255,.22)';
-    if (on){ c.shadowColor = '#ffb13d'; c.shadowBlur = 12; }
-    c.beginPath(); c.arc(x, T.lights.y, 4.6, 0, Math.PI * 2); c.fill(); c.shadowBlur = 0;
+    const pop = G.fx.find(f => f.kind === 'light' && f.i === i && t >= f.t0 && t < f.t1), pu = pop ? (t - pop.t0) / (pop.t1 - pop.t0) : 1;
+    c.fillStyle = on ? (hot ? '#ffcf5a' : '#ffe08a') : 'rgba(255,255,255,.2)';
+    if (on){ c.shadowColor = hot ? '#ff8a1d' : '#ffb13d'; c.shadowBlur = 12 + (pop ? 14 * (1 - pu) : 0); }
+    c.beginPath(); c.arc(x, T.lights.y, 4.6 * (1 + (pop ? 0.9 * (1 - pu) : 0)), 0, Math.PI * 2); c.fill(); c.shadowBlur = 0;
   }
   // колода
   const d = T.deck, deckN = s.deck.length, hasDeck = LEVELS[G.li].D > 0 || deckN > 0;
   if (hasDeck){
-    const glow = G.phase === 'play' && deckN && !moves(s).length ? 0.5 + 0.5 * Math.sin(t / 220) : 0;
+    const glow = G.phase === 'play' && deckN && !moves(s).length ? 0.5 + 0.5 * Math.sin(t / 220) : 0, ps = G.press && G.press.deck ? CFG.PRESS_SCALE : 1;
+    c.save(); c.translate(d.x, d.y + d.h / 2); c.scale(ps, ps); c.translate(-d.x, -(d.y + d.h / 2));
     if (glow){ c.save(); c.shadowColor = '#ffd36b'; c.shadowBlur = 12 + 12 * glow; c.fillStyle = 'rgba(255,211,107,.5)'; rr(c, d.x - d.w / 2 - 3, d.y - 3, d.w + 6, d.h + 6, 9); c.fill(); c.restore(); }
     for (let i = Math.min(5, deckN) - 1; i >= 0; i--) drawStrawBack(c, d.x - d.w / 2 - i * 1.4, d.y - i * 1.8, d.w, d.h);
     if (!deckN){ c.strokeStyle = 'rgba(255,240,210,.35)'; c.setLineDash([5, 4]); c.lineWidth = 1.5; rr(c, d.x - d.w / 2, d.y, d.w, d.h, 7); c.stroke(); c.setLineDash([]); }
+    c.restore();
     c.fillStyle = 'rgba(20,12,4,.8)'; rr(c, d.x - 17, d.y + d.h + 4, 34, 21, 10); c.fill();
     c.fillStyle = '#fff'; c.font = '900 14px Nunito, system-ui, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(String(deckN), d.x, d.y + d.h + 15);
   }
-  // отбой и призраки ±1
+  // отбой и призраки ±1; карта ложится с отскоком
   const cur = T.cur, shown = V.top, pulse = 0.5 + 0.5 * Math.sin(t / 380), gh = T.ghost;
   drawGhost(c, (rk(shown) + 12) % 13, cur.x - gh.w - 5, gh.y, gh.w, gh.h, pulse);
   drawGhost(c, (rk(shown) + 1) % 13, cur.x + 5, gh.y, gh.w, gh.h, pulse);
+  const land = G.fx.find(f => f.kind === 'land' && t >= f.t0 && t < f.t1);
+  c.save();
+  if (land){ const u = (t - land.t0) / (land.t1 - land.t0), k = CFG.SQUASH * Math.sin(Math.PI * Math.min(1, u * 1.7)) * (1 - u);
+    c.translate(cur.x, cur.y + cur.h); c.scale(1 + 0.6 * k, 1 - k); c.translate(-cur.x, -(cur.y + cur.h)); }
   drawCardFace(c, shown, cur.x - cur.w / 2, cur.y, cur.w, cur.h);
-  // монета за серию, раздача «+5»
+  c.restore();
+  // монета за серию, подпись серии, раздача «+5»
   for (const f of G.fx){
     if (t < f.t0 || t > f.t1) continue;
     const u = (t - f.t0) / (f.t1 - f.t0);
     if (f.kind === 'coin'){ c.globalAlpha = 1 - u; c.fillStyle = '#ffe08a'; c.font = '900 18px Nunito, system-ui, sans-serif'; c.textAlign = 'center'; c.fillText('+1', cur.x + cur.w / 2 + 24, cur.y + 10 - 30 * u); c.globalAlpha = 1; }
+    if (f.kind === 'streak'){
+      c.save(); c.globalAlpha = Math.min(1, (1 - u) * 2.5); c.translate(VW / 2, T.lights.y - 18 - 10 * u); const s = 1 + 0.35 * Math.max(0, 1 - u * 4); c.scale(s, s);
+      c.font = '900 17px Nunito, system-ui, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.lineJoin = 'round';
+      c.lineWidth = 4; c.strokeStyle = 'rgba(70,30,0,.85)'; c.strokeText('серия ' + f.n + '!', 0, 0); c.fillStyle = '#ffd25e'; c.fillText('серия ' + f.n + '!', 0, 0);
+      c.restore();
+    }
     if (f.kind === 'deal'){ const e = easeIO(u); drawStrawBack(c, f.x0 + (f.x1 - f.x0) * e - 26, f.y0 + (f.y1 - f.y0) * e, 52, 74); }
+  }
+}
+// Монеты летят от взятой золотой в кошелёк в шапке (точка — по живому положению монетки в DOM).
+function coinTarget(){
+  const el = document.querySelector('header .coin'), r = cv.getBoundingClientRect();
+  if (!el) return { x: VW - 80, y: 20 };
+  const q = el.getBoundingClientRect(); return { x: (q.left + q.width / 2 - r.left) / scale, y: (q.top + q.height / 2 - r.top) / scale };
+}
+function drawCoinFly(c, t){
+  let tg = null;
+  for (const f of G.fx){
+    if (f.kind !== 'coinfly' || t < f.t0 || t > f.t1) continue;
+    tg = tg || coinTarget();
+    const u = easeIO((t - f.t0) / (f.t1 - f.t0)), a = f.i * 0.7, x = f.x0 + (tg.x - f.x0) * u + Math.cos(a) * 40 * Math.sin(Math.PI * u), y = f.y0 + (tg.y - f.y0) * u + Math.sin(a) * 30 * Math.sin(Math.PI * u);
+    const g = c.createRadialGradient(x - 2, y - 2, 1, x, y, 8); g.addColorStop(0, '#ffe9a6'); g.addColorStop(0.6, '#f2b233'); g.addColorStop(1, '#c98516');
+    c.fillStyle = g; c.beginPath(); c.arc(x, y, 7, 0, Math.PI * 2); c.fill();
   }
 }
 function render(t){
   const c = ctx;
   c.setTransform(DPR * scale, 0, 0, DPR * scale, 0, 0);
   if (G.screen === 'cut'){ drawCut(c, t); return; }
-  if (!G.vis || !G.s){ const P = palette(), g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, P.skyTop); g.addColorStop(1, P.skyLow); c.fillStyle = g; c.fillRect(0, 0, VW, H); drawCloud(c, 110, 200, 40); drawCloud(c, 300, 330, 34); return; }
-  camUpdate(t);
+  if (!G.vis || !G.s){
+    if (ready('bgTop')) drawBackdrop(c, ART.bgTop, 0);
+    else { const P = palette(), g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, P.skyTop); g.addColorStop(1, P.skyLow); c.fillStyle = g; c.fillRect(0, 0, VW, H); drawCloud(c, 110, 200, 40); drawCloud(c, 300, 330, 34); }
+    return;
+  }
+  camUpdate(t); sparkGold(t);
+  let sx = 0, sy = 0;                                                       // тряска поля при осыпи (панель не трясётся)
+  if (G.shake && t < G.shake.t1){ const u = (t - G.shake.t0) / (G.shake.t1 - G.shake.t0), a = G.shake.amp * (1 - u); sx = Math.sin(t * 0.11) * a; sy = Math.cos(t * 0.17) * a * 0.7; }
+  c.save(); c.translate(sx, sy);
   if (G.mode === 'top') drawSceneTop(c, t); else drawSceneBottom(c, t);
   drawColumns(c, t);
   if (G.mode === 'bottom') drawCloudCap(c, t);
   drawParts(c, t);
+  c.restore();
   drawTray(c, t);
   drawTweens(c, t);
+  drawCoinFly(c, t);
   if (G.hand && G.phase === 'play' && G.screen === 'game'){ const q = topPos(G.hand.lane, t); drawHand(c, q.x, q.y + CFG.CARD_H * 0.55, t); }
+  if (G.flash && t < G.flash.t1){ c.fillStyle = 'rgba(255,248,215,' + (0.5 * (1 - (t - G.flash.t0) / (G.flash.t1 - G.flash.t0))).toFixed(3) + ')'; c.fillRect(0, 0, VW, H); }
 }
 function tick(t){
   pumpVis(t); endTweens(t);
